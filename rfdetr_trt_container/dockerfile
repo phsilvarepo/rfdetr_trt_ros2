@@ -1,0 +1,62 @@
+# 1. Use the DEVEL image to provide 'cuda.h' headers needed for PyCUDA
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
+
+# 2. Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 3. Setup Locales for ROS2
+RUN apt-get update && apt-get install -y locales && \
+    locale-gen en_US en_US.UTF-8 && \
+    update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV ROS_DISTRO=humble
+
+# 4. Install ROS2 Humble repositories
+RUN apt-get update && apt-get install -y \
+    curl \
+    gnupg2 \
+    lsb-release \
+    && curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null
+
+RUN apt-get update && apt-get install -y \
+    ros-humble-ros-base \
+    ros-humble-cv-bridge \
+    python3-pip \
+    python3-colcon-common-extensions \
+    python3-rosdep \
+    python3-libnvinfer \
+    libnvinfer8 \
+    python3-dev \
+    build-essential \
+    libgpgme-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 6. Set CUDA Paths (CRITICAL for PyCUDA build)
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+ENV CUDA_ROOT="/usr/local/cuda"
+
+# 7. Install Python requirements - pin numpy AFTER all other packages
+RUN pip3 install --no-cache-dir pycuda opencv-python tensorrt==10.14.1.48.post1
+RUN pip3 install --no-cache-dir "numpy<2.0"
+
+# 8. Workspace Setup
+WORKDIR /ros_ws
+COPY ./rfdetr_trt_node /ros_ws/src/rfdetr_trt_node
+
+# 9. Build the ROS2 Node
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && colcon build --symlink-install"
+
+# 10. Standardized Environment Variables
+ENV MODEL_PATH="/ros_ws/src/rfdetr_trt_node/rfdetr_trt_node/models/rfdetr_trt.engine"
+ENV INPUT_TOPIC="/rgb"
+ENV OUTPUT_TOPIC="/rfdetr/image_annotated"
+ENV CONFIDENCE_THRESHOLD="0.5"
+ENV IMAGE_RESOLUTION="576"
+ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+
+# 11. Run the node
+ENTRYPOINT ["/bin/bash", "-c", "source /ros_ws/install/setup.bash && ros2 run rfdetr_trt_node rfdetr_trt_node"]

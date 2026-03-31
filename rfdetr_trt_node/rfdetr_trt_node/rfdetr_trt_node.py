@@ -8,32 +8,61 @@ import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
+import os
 
 class RfdetrTRTNode(Node):
     def __init__(self):
         super().__init__('rfdetr_trt_node')
 
-        self.declare_parameter('engine_path', '/home/unparallel/ros2_ws/src/rfdetr_trt_node/rfdetr_trt_node/models/rfdetr_trt.engine')
-        self.engine_path = self.get_parameter('engine_path').get_parameter_value().string_value
+        # 1. Fetch values from Environment Variables
+        env_model = os.environ.get('MODEL_PATH', '/ros_ws/src/rfdetr_trt_node/rfdetr_trt_node/models/rfdetr_trt.engine')
+        env_input = os.environ.get('INPUT_TOPIC', '/camera/image_raw')
+        env_output = os.environ.get('OUTPUT_TOPIC', '/rfdetr/image_annotated')
+        env_conf = os.environ.get('CONFIDENCE_THRESHOLD', '0.5')
+        self.img_size = int(os.getenv('IMAGE_RESOLUTION', '576'))
+
+        # 2. Declare ROS parameters
+        self.declare_parameter('engine_path', env_model)
+        self.declare_parameter('input_topic', env_input)
+        self.declare_parameter('output_topic', env_output)
+        self.declare_parameter('conf_threshold', float(env_conf))
+
+        # 3. Get values
+        self.engine_path = self.get_parameter('engine_path').value
+        self.input_topic = self.get_parameter('input_topic').value
+        self.output_topic = self.get_parameter('output_topic').value
+        self.conf = self.get_parameter('conf_threshold').value
+
+        self.get_logger().info(f"--- RF-DETR TRT Initialized ---")
+        self.get_logger().info(f"Engine: {self.engine_path} | Conf: {self.conf}")
+        self.get_logger().info(f"Subscribed to: {self.input_topic}")
+        self.get_logger().info(f"Publishing to: {self.output_topic}")
 
         self.bridge = CvBridge()
-        self.subscription = self.create_subscription(
-            Image, '/camera/image_raw', self.image_callback, 10)
-        self.publisher = self.create_publisher(Image, '/rfdetr/image_annotated', 10)
-
         self.load_engine()
+
+        # 4. Subscriber and Publisher
+        self.subscription = self.create_subscription(
+            Image, self.input_topic, self.image_callback, 10)
+        self.publisher = self.create_publisher(
+            Image, self.output_topic, 10)
 
     def load_engine(self):
         TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-        trt.init_libnvinfer_plugins(None, "")  # Initialize plugins[web:2]
+        trt.init_libnvinfer_plugins(None, "")
+        
+        if not os.path.exists(self.engine_path):
+            self.get_logger().error(f"Engine file not found: {self.engine_path}")
+            return
+
         with open(self.engine_path, 'rb') as f, trt.Runtime(TRT_LOGGER) as runtime:
             self.engine = runtime.deserialize_cuda_engine(f.read())
+        
         self.context_trt = self.engine.create_execution_context()
-
         self.inputs, self.outputs, self.bindings, self.stream = [], [], [], cuda.Stream()
 
         for i in range(self.engine.num_io_tensors):
-            binding_name = self.engine.get_tensor_name(i)  # Use the updated API
+            binding_name = self.engine.get_tensor_name(i)
             shape = self.engine.get_tensor_shape(binding_name)
             dtype = trt.nptype(self.engine.get_tensor_dtype(binding_name))
             device_mem = cuda.mem_alloc(trt.volume(shape) * np.dtype(dtype).itemsize)
@@ -43,81 +72,60 @@ class RfdetrTRTNode(Node):
                 self.inputs.append({'binding': binding_name, 'device_mem': device_mem, 'dtype': dtype, 'shape': shape})
             else:
                 self.outputs.append({'binding': binding_name, 'device_mem': device_mem, 'dtype': dtype, 'shape': shape})
-        
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            mode = self.engine.get_tensor_mode(name)
-            print(f"{i}: {name} ({mode}) shape={self.engine.get_tensor_shape(name)}")
-
-        self.get_logger().info("RF-DETR TensorRT engine loaded.")
-
 
     def preprocess(self, img):
-        # Adapt to your model’s input resolution
-        resized = cv2.resize(img, (576, 576))
+        # Use dynamic resolution from params
+        resized = cv2.resize(img, (self.img_size, self.img_size))
         img_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         img_norm = img_rgb.astype(np.float32) / 255.0
         img_transposed = np.transpose(img_norm, (2, 0, 1))
         input_tensor = np.expand_dims(img_transposed, axis=0).astype(np.float32)
         return np.ascontiguousarray(input_tensor)
 
-
     def image_callback(self, msg):
+        self.get_logger().info("Processing image...")
         cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         input_tensor = self.preprocess(cv_img)
 
-        # Copy input to device
         cuda.memcpy_htod(self.inputs[0]['device_mem'], input_tensor)
-
-        # Execute model
-        # Execute model
         self.context_trt.execute_v2(self.bindings)
 
-        # Retrieve both outputs
-        boxes_shape = self.engine.get_tensor_shape(self.outputs[0]['binding'])  # (1, 300, 4)
-        labels_shape = self.engine.get_tensor_shape(self.outputs[1]['binding']) # (1, 300, 91)
+        # Retrieve outputs
+        boxes_shape = self.engine.get_tensor_shape(self.outputs[0]['binding'])
+        labels_shape = self.engine.get_tensor_shape(self.outputs[1]['binding'])
 
         boxes_host = np.empty(trt.volume(boxes_shape), dtype=np.float32)
         labels_host = np.empty(trt.volume(labels_shape), dtype=np.float32)
 
-        # Copy from device to host
         cuda.memcpy_dtoh(boxes_host, self.outputs[0]['device_mem'])
         cuda.memcpy_dtoh(labels_host, self.outputs[1]['device_mem'])
 
-        # Reshape
-        boxes = boxes_host.reshape(1, 300, 4)[0]       # [300, 4]
-        logits = labels_host.reshape(1, 300, 91)[0]    # [300, 91]
+        boxes = boxes_host.reshape(1, 300, 4)[0]
+        logits = labels_host.reshape(1, 300, 91)[0]
 
-        # Convert logits to probabilities
         probs = np.exp(logits) / np.sum(np.exp(logits), axis=-1, keepdims=True)
-
-        # Get confidence and class ID for each of the 300 queries
-        scores = np.max(probs, axis=-1)     # [300]
-        class_ids = np.argmax(probs, axis=-1)  # [300]
+        scores = np.max(probs, axis=-1)
+        class_ids = np.argmax(probs, axis=-1)
 
         H, W = cv_img.shape[:2]
         detections = []
 
         for i in range(300):
-            cx, cy, bw, bh = boxes[i]
-            conf = scores[i]
-            cls = class_ids[i]
-
-            if conf < 0.5:  # confidence threshold
+            if scores[i] < self.conf: # Use dynamic threshold
                 continue
 
-            # Convert normalized (cx,cy,w,h) to pixel (x1,y1,x2,y2)
+            cx, cy, bw, bh = boxes[i]
             x1 = int((cx - bw / 2) * W)
             y1 = int((cy - bh / 2) * H)
             x2 = int((cx + bw / 2) * W)
             y2 = int((cy + bh / 2) * H)
-
-            detections.append([x1, y1, x2, y2, conf, cls])
+            detections.append([x1, y1, x2, y2, scores[i], class_ids[i]])
         
         detections = self.nms(detections, iou_threshold=0.5)
         annotated = self.draw_boxes(cv_img, detections)
 
         out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
+        out_msg.header = msg.header
         self.publisher.publish(out_msg)
 
 
