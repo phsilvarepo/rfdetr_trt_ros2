@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
 RUN apt-get update && apt-get install -y \
     ros-humble-ros-base \
     ros-humble-cv-bridge \
+    ros-humble-vision-msgs \
     python3-pip \
     python3-colcon-common-extensions \
     python3-rosdep \
@@ -51,11 +52,6 @@ COPY ./rfdetr_trt_node /ros_ws/src/rfdetr_trt_node
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && colcon build --symlink-install"
 
 # 10. Standardized Environment Variables
-ENV MODEL_PATH="/ros_ws/src/rfdetr_trt_node/rfdetr_trt_node/models/rfdetr_trt.engine"
-ENV INPUT_TOPIC="/rgb"
-ENV OUTPUT_TOPIC="/rfdetr/image_annotated"
-ENV CONFIDENCE_THRESHOLD="0.5"
-ENV IMAGE_RESOLUTION="576"
 ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 
 # 11. Run the node

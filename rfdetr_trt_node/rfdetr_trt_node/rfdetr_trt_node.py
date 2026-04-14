@@ -2,6 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -10,42 +11,43 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 import os
 
+COCO_CLASSES = [
+    'N/A', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+    'traffic light', 'fire hydrant', 'N/A', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack',
+    'umbrella', 'N/A', 'N/A', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard',
+    'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
+    'tennis racket', 'bottle', 'N/A', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+    'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut',
+    'cake', 'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table', 'N/A', 'N/A',
+    'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave',
+    'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book', 'clock', 'vase', 'scissors',
+    'teddy bear', 'hair drier', 'toothbrush'
+]
+
 class RfdetrTRTNode(Node):
     def __init__(self):
         super().__init__('rfdetr_trt_node')
 
         # 1. Fetch values from Environment Variables
-        env_model = os.environ.get('MODEL_PATH', '/ros_ws/src/rfdetr_trt_node/rfdetr_trt_node/models/rfdetr_trt.engine')
-        env_input = os.environ.get('INPUT_TOPIC', '/camera/image_raw')
-        env_output = os.environ.get('OUTPUT_TOPIC', '/rfdetr/image_annotated')
-        env_conf = os.environ.get('CONFIDENCE_THRESHOLD', '0.5')
-        self.img_size = int(os.getenv('IMAGE_RESOLUTION', '576'))
-
-        # 2. Declare ROS parameters
-        self.declare_parameter('engine_path', env_model)
-        self.declare_parameter('input_topic', env_input)
-        self.declare_parameter('output_topic', env_output)
-        self.declare_parameter('conf_threshold', float(env_conf))
-
-        # 3. Get values
-        self.engine_path = self.get_parameter('engine_path').value
-        self.input_topic = self.get_parameter('input_topic').value
-        self.output_topic = self.get_parameter('output_topic').value
-        self.conf = self.get_parameter('conf_threshold').value
-
+        input_topic = os.environ.get('INPUT_TOPIC', '/image_raw')
+        self.engine_path = os.environ.get('MODEL_PATH', '/ros_ws/src/rfdetr_trt_node/rfdetr_trt_node/models/rfdetr_trt.engine')
+        self.conf = float(os.environ.get('CONFIDENCE_THRESHOLD', '0.5'))
+        self.img_size = int(os.environ.get('IMAGE_RESOLUTION', '547'))
+        
         self.get_logger().info(f"--- RF-DETR TRT Initialized ---")
         self.get_logger().info(f"Engine: {self.engine_path} | Conf: {self.conf}")
-        self.get_logger().info(f"Subscribed to: {self.input_topic}")
-        self.get_logger().info(f"Publishing to: {self.output_topic}")
+        self.get_logger().info(f"Subscribed to: {input_topic}")
 
         self.bridge = CvBridge()
         self.load_engine()
 
-        # 4. Subscriber and Publisher
-        self.subscription = self.create_subscription(
-            Image, self.input_topic, self.image_callback, 10)
-        self.publisher = self.create_publisher(
-            Image, self.output_topic, 10)
+        # 4. Subscriber
+        self.subscription = self.create_subscription(Image, input_topic, self.image_callback, 10)
+        
+        # 3. Dynamic Publishers based on Dashboard Envs
+        self.img_pub = self.create_publisher(Image, os.environ['OUTPUT_TOPIC_IMAGE'], 10) if 'OUTPUT_TOPIC_IMAGE' in os.environ else None
+        self.bb_pub = self.create_publisher(Detection2DArray, os.environ['OUTPUT_TOPIC_BB'], 10) if 'OUTPUT_TOPIC_BB' in os.environ else None
 
     def load_engine(self):
         TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
@@ -83,14 +85,12 @@ class RfdetrTRTNode(Node):
         return np.ascontiguousarray(input_tensor)
 
     def image_callback(self, msg):
-        self.get_logger().info("Processing image...")
         cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         input_tensor = self.preprocess(cv_img)
 
         cuda.memcpy_htod(self.inputs[0]['device_mem'], input_tensor)
         self.context_trt.execute_v2(self.bindings)
 
-        # Retrieve outputs
         boxes_shape = self.engine.get_tensor_shape(self.outputs[0]['binding'])
         labels_shape = self.engine.get_tensor_shape(self.outputs[1]['binding'])
 
@@ -108,25 +108,48 @@ class RfdetrTRTNode(Node):
         class_ids = np.argmax(probs, axis=-1)
 
         H, W = cv_img.shape[:2]
-        detections = []
-
+        raw_detections = []
         for i in range(300):
-            if scores[i] < self.conf: # Use dynamic threshold
+            if scores[i] < self.conf:
                 continue
-
             cx, cy, bw, bh = boxes[i]
             x1 = int((cx - bw / 2) * W)
             y1 = int((cy - bh / 2) * H)
             x2 = int((cx + bw / 2) * W)
             y2 = int((cy + bh / 2) * H)
-            detections.append([x1, y1, x2, y2, scores[i], class_ids[i]])
-        
-        detections = self.nms(detections, iou_threshold=0.5)
-        annotated = self.draw_boxes(cv_img, detections)
+            raw_detections.append([x1, y1, x2, y2, scores[i], class_ids[i]])
 
-        out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
-        out_msg.header = msg.header
-        self.publisher.publish(out_msg)
+        detections = self.nms(raw_detections, iou_threshold=0.5)
+
+        # --- Output 1: Debug Image ---
+        if self.img_pub:
+            annotated = self.draw_boxes(cv_img.copy(), detections)
+            img_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
+            img_msg.header = msg.header
+            self.img_pub.publish(img_msg)
+
+        # --- Output 2: Detection2DArray ---
+        if self.bb_pub:
+            bb_msg = Detection2DArray()
+            bb_msg.header = msg.header
+
+            for det in detections:
+                x1, y1, x2, y2, score, class_id = det
+
+                d = Detection2D()
+                d.header = msg.header
+                d.bbox.center.position.x = float((x1 + x2) / 2.0)
+                d.bbox.center.position.y = float((y1 + y2) / 2.0)
+                d.bbox.size_x = float(x2 - x1)
+                d.bbox.size_y = float(y2 - y1)
+
+                hyp = ObjectHypothesisWithPose()
+                hyp.hypothesis.class_id = COCO_CLASSES[int(class_id)]
+                hyp.hypothesis.score = float(score)
+                d.results.append(hyp)
+                bb_msg.detections.append(d)
+
+            self.bb_pub.publish(bb_msg)
 
 
     def draw_boxes(self, image, detections):
